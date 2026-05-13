@@ -1,0 +1,15 @@
+[source.crates-io]
+# 替换成crates.io的镜像源
+replace-with = 'aliyun'
+
+[source.tuna]
+registry = "https://mirrors.tuna.tsinghua.edu.cn/git/crates.io-index.git"
+
+#阿里云
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+
+# 可选：如果依赖有git仓库，可配置git镜像加速（比如github镜像）
+[net]
+git-fetch-with-cli = true

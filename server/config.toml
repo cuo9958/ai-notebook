@@ -1,0 +1,16 @@
+[server]
+# 文件根目录，所有用户的文件都存放在此目录下
+root_dir = "./files"
+# 服务监听端口
+port = 3000
+
+# 用户配置列表（注意这里必须是 [[server.users]]）
+[[server.users]]
+name = "admin"
+api_key = "admin-secret-key-1234567890abcdef"
+storage_path = "admin"
+
+[[server.users]]
+name = "user1"
+api_key = "user1-access-key-1234567890abcdef"
+storage_path = "user1_files"
