@@ -21,6 +21,50 @@ function formatTime(value: string) {
     second: '2-digit',
   })
 }
+
+function getSourceLabel(source: string) {
+  if (source === 'backend') {
+    return 'Rust 后端'
+  }
+
+  if (source === 'frontend-console') {
+    return '前端 Console'
+  }
+
+  if (source === 'request') {
+    return '请求'
+  }
+
+  return '前端动作'
+}
+
+function getPhaseLabel(phase?: string) {
+  if (phase === 'send') {
+    return '发出'
+  }
+
+  if (phase === 'receive') {
+    return '收到'
+  }
+
+  return ''
+}
+
+function getLevelLabel(level: string) {
+  if (level === 'success') {
+    return '成功'
+  }
+
+  if (level === 'warn') {
+    return '警告'
+  }
+
+  if (level === 'error') {
+    return '错误'
+  }
+
+  return '信息'
+}
 </script>
 
 <template>
@@ -38,11 +82,19 @@ function formatTime(value: string) {
     </header>
 
     <div class="debug-log-list">
-      <article v-for="log in logs" :key="log.id" class="debug-log-item" :data-level="log.level">
+      <article
+        v-for="log in logs"
+        :key="log.id"
+        class="debug-log-item"
+        :data-level="log.level"
+        :data-source="log.source"
+        :data-phase="log.phase"
+      >
         <div class="debug-log-item__meta">
           <span>{{ formatTime(log.timestamp) }}</span>
-          <span>{{ log.source }}</span>
-          <span>{{ log.level }}</span>
+          <span class="debug-log-badge">{{ getSourceLabel(log.source) }}</span>
+          <span v-if="log.phase" class="debug-log-badge debug-log-badge--phase">{{ getPhaseLabel(log.phase) }}</span>
+          <span class="debug-log-badge">{{ getLevelLabel(log.level) }}</span>
         </div>
         <strong>{{ log.action }}</strong>
         <p v-if="log.detail">{{ log.detail }}</p>
@@ -129,19 +181,55 @@ function formatTime(value: string) {
   background: rgba(180, 62, 36, 0.12);
 }
 
+.debug-log-item[data-level='warn'] {
+  border-color: rgba(245, 158, 11, 0.38);
+  background: rgba(245, 158, 11, 0.11);
+}
+
 .debug-log-item[data-level='success'] {
   border-color: rgba(88, 168, 114, 0.36);
   background: rgba(88, 168, 114, 0.1);
 }
 
+.debug-log-item[data-source='backend'] {
+  border-left: 3px solid #60a5fa;
+}
+
+.debug-log-item[data-source='frontend-console'] {
+  border-left: 3px solid #f59e0b;
+}
+
+.debug-log-item[data-source='request'][data-phase='send'] {
+  border-left: 3px solid #a78bfa;
+}
+
+.debug-log-item[data-source='request'][data-phase='receive'] {
+  border-left: 3px solid #34d399;
+}
+
 .debug-log-item__meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 6px;
   color: rgba(243, 228, 214, 0.72);
   font-family: var(--font-mono);
   font-size: 11px;
   text-transform: uppercase;
+}
+
+.debug-log-badge {
+  border: 1px solid rgba(243, 228, 214, 0.16);
+  border-radius: 999px;
+  background: rgba(255, 247, 239, 0.08);
+  padding: 2px 7px;
+  color: rgba(255, 247, 239, 0.86);
+}
+
+.debug-log-badge--phase {
+  border-color: rgba(96, 165, 250, 0.28);
+  background: rgba(96, 165, 250, 0.12);
+  color: #bfdbfe;
 }
 
 .debug-log-item strong {

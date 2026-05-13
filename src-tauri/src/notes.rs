@@ -13,12 +13,15 @@ const DEFAULT_BACKUP_RETENTION_DAYS: u64 = 7;
 const NOTE_INDEX_FILE: &str = ".note-index.json";
 const NOTE_CONTENT_DIR: &str = ".note-files";
 const NOTE_ASSET_DIR: &str = ".note-assets";
+const NOTE_DELETED_DIR: &str = ".note-deleted";
 const NOTE_SYNC_SERVER_URL_KEY: &str = "noteSyncServerUrl";
 const NOTE_SYNC_API_KEY_KEY: &str = "noteSyncApiKey";
 const NOTE_SYNC_LAST_SYNCED_AT_KEY: &str = "noteSyncLastSyncedAt";
 const DEFAULT_NOTE_SYNC_SERVER_URL: &str = "http://localhost:3000";
 const DEFAULT_NOTE_SYNC_API_KEY: &str = "TRpLxzmSyMxVHAINVdj0sdqFKcIN8vSF";
 const DEBUG_MODE_ENABLED_KEY: &str = "debugModeEnabled";
+const MAX_GENERATED_SYNC_FILE_NAME_BYTES: usize = 120;
+const MAX_SYNC_FILE_NAME_BYTES: usize = 180;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +103,8 @@ pub struct DebugSettings {
 
 #[derive(Clone)]
 struct LocalNoteSyncFile {
+    id: String,
+    sync_id: Option<String>,
     title: String,
     path: PathBuf,
     relative_path: String,
@@ -120,6 +125,10 @@ struct ServerFileInfo {
     last_updated: String,
     #[allow(dead_code)]
     version: u32,
+    #[serde(default)]
+    is_deleted: bool,
+    #[allow(dead_code)]
+    deleted_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -225,14 +234,28 @@ pub struct BackupDocument {
 #[serde(rename_all = "camelCase")]
 struct NoteDirectoryIndex {
     notes: Vec<NoteIndexRecord>,
+    #[serde(default)]
+    deleted: Vec<NoteDeletionRecord>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct NoteIndexRecord {
     id: String,
+    #[serde(default)]
+    sync_id: Option<String>,
     name: String,
     updated_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NoteDeletionRecord {
+    id: String,
+    #[serde(default)]
+    sync_id: Option<String>,
+    relative_path: String,
+    deleted_at: String,
 }
 
 fn settings_file_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -542,10 +565,20 @@ fn note_asset_dir(directory: &Path, note_id: &str) -> PathBuf {
     note_asset_root(directory).join(note_id)
 }
 
+fn note_deleted_dir(directory: &Path) -> PathBuf {
+    directory.join(NOTE_DELETED_DIR)
+}
+
+fn note_deleted_path(directory: &Path, note_id: &str) -> PathBuf {
+    note_deleted_dir(directory).join(format!("{note_id}.md"))
+}
+
 fn is_reserved_entry(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
-        .is_some_and(|name| name == NOTE_INDEX_FILE || name == NOTE_CONTENT_DIR || name == NOTE_ASSET_DIR)
+        .is_some_and(|name| {
+            name == NOTE_INDEX_FILE || name == NOTE_CONTENT_DIR || name == NOTE_ASSET_DIR || name == NOTE_DELETED_DIR
+        })
 }
 
 fn ensure_directory_storage(directory: &Path) -> Result<(), String> {
@@ -712,6 +745,23 @@ fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|value| value.with_timezone(&chrono::Utc))
 }
 
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    value[..end].to_string()
+}
+
 fn sanitize_sync_file_name(value: &str) -> String {
     let sanitized = value
         .trim()
@@ -726,11 +776,62 @@ fn sanitize_sync_file_name(value: &str) -> String {
         .trim_matches('.')
         .to_string();
 
-    if sanitized.is_empty() {
-        "Untitled Note.md".into()
+    let stem = if sanitized.is_empty() {
+        "Untitled Note".to_string()
     } else {
-        format!("{sanitized}.md")
+        truncate_utf8(&sanitized, MAX_GENERATED_SYNC_FILE_NAME_BYTES)
+    };
+
+    format!("{stem}.md")
+}
+
+fn validate_sync_file_name(file_name: &str) -> Result<(), String> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return Err("同步文件名为空，请检查笔记标题后重试".to_string());
     }
+
+    if trimmed.len() > MAX_SYNC_FILE_NAME_BYTES {
+        return Err(format!(
+            "同步文件名过长，请缩短笔记标题后重试：{}",
+            trimmed
+        ));
+    }
+
+    if trimmed.chars().any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()) {
+        return Err(format!("同步文件名包含非法字符，请修改后重试：{}", trimmed));
+    }
+
+    if trimmed == "." || trimmed == ".." || trimmed.ends_with('.') {
+        return Err(format!("同步文件名格式不合法，请修改后重试：{}", trimmed));
+    }
+
+    Ok(())
+}
+
+fn validate_sync_relative_path(relative_path: &str) -> Result<(), String> {
+    let trimmed = relative_path.trim().trim_start_matches("./");
+    if trimmed.is_empty() {
+        return Err("同步路径为空，请检查远端文件信息".to_string());
+    }
+
+    for component in trimmed.split('/') {
+        validate_sync_file_name(component)?;
+    }
+
+    Ok(())
+}
+
+fn sync_upload_file_name(relative_path: &str, title: &str) -> Result<String, String> {
+    let file_name = relative_path
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| sanitize_sync_file_name(title));
+
+    validate_sync_file_name(&file_name)?;
+    Ok(file_name)
 }
 
 fn relative_sync_path(app: &AppHandle, directory: &Path, title: &str) -> Result<String, String> {
@@ -741,6 +842,103 @@ fn relative_sync_path(app: &AppHandle, directory: &Path, title: &str) -> Result<
         .map_err(|error| format!("Failed to build sync relative path: {error}"))?;
     let relative = relative_directory.join(sanitize_sync_file_name(title));
     Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn update_note_sync_id(directory: &Path, note_id: &str, sync_id: &str) -> Result<(), String> {
+    let mut index = read_directory_index(directory)?;
+    if let Some(record) = index.notes.iter_mut().find(|record| record.id == note_id) {
+        record.sync_id = Some(sync_id.to_string());
+        write_directory_index(directory, &index)?;
+    }
+    Ok(())
+}
+
+fn collect_local_deletions(directory: &Path, deleted: &mut Vec<NoteDeletionRecord>) -> Result<(), String> {
+    ensure_directory_storage(directory)?;
+
+    for entry in fs::read_dir(directory).map_err(|error| format!("Failed to read deleted sync directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("Failed to read deleted sync directory entry: {error}"))?;
+        let entry_path = entry.path();
+
+        if is_reserved_entry(&entry_path) {
+            continue;
+        }
+
+        if entry_path.is_dir() {
+            collect_local_deletions(&entry_path, deleted)?;
+        }
+    }
+
+    let index = read_directory_index(directory)?;
+    deleted.extend(index.deleted);
+    Ok(())
+}
+
+fn cleanup_expired_deletions(app: &AppHandle, directory: &Path) -> Result<(), String> {
+    ensure_directory_storage(directory)?;
+
+    for entry in fs::read_dir(directory).map_err(|error| format!("Failed to read deletion cleanup directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("Failed to read deletion cleanup entry: {error}"))?;
+        let entry_path = entry.path();
+
+        if is_reserved_entry(&entry_path) {
+            continue;
+        }
+
+        if entry_path.is_dir() {
+            cleanup_expired_deletions(app, &entry_path)?;
+        }
+    }
+
+    let settings = read_note_settings(app)?;
+    let max_age = chrono::Duration::days(settings.backup_retention_days.clamp(1, 30) as i64);
+    let now = chrono::Utc::now();
+    let mut index = read_directory_index(directory)?;
+    let mut retained = Vec::new();
+
+    for deleted in index.deleted {
+        let expired = parse_rfc3339(&deleted.deleted_at)
+            .is_some_and(|deleted_at| now.signed_duration_since(deleted_at) > max_age);
+        if expired {
+            let deleted_path = note_deleted_path(directory, &deleted.id);
+            let _ = fs::remove_file(deleted_path);
+        } else {
+            retained.push(deleted);
+        }
+    }
+
+    index.deleted = retained;
+    write_directory_index(directory, &index)
+}
+
+fn mark_local_note_deleted(app: &AppHandle, directory: &Path, note_id: &str) -> Result<(), String> {
+    let mut index = read_directory_index(directory)?;
+    let Some(position) = index.notes.iter().position(|record| record.id == note_id) else {
+        return Ok(());
+    };
+
+    let record = index.notes.remove(position);
+    let relative_path = relative_sync_path(app, directory, &record.name)?;
+    let deleted_at = now_rfc3339();
+
+    let note_path = note_content_path(directory, note_id);
+    if note_path.exists() {
+        fs::create_dir_all(note_deleted_dir(directory))
+            .map_err(|error| format!("Failed to create deleted note directory: {error}"))?;
+        let deleted_path = note_deleted_path(directory, note_id);
+        fs::rename(&note_path, &deleted_path).or_else(|_| {
+            fs::copy(&note_path, &deleted_path)?;
+            fs::remove_file(&note_path)
+        }).map_err(|error| format!("Failed to move deleted note: {error}"))?;
+    }
+
+    index.deleted.push(NoteDeletionRecord {
+        id: record.id,
+        sync_id: record.sync_id,
+        relative_path,
+        deleted_at,
+    });
+    write_directory_index(directory, &index)
 }
 
 fn backup_timestamp() -> String {
@@ -789,6 +987,7 @@ fn migrate_legacy_directory(directory: &Path) -> Result<(), String> {
 
         index.notes.push(NoteIndexRecord {
             id: note_id,
+            sync_id: None,
             name: unique_title,
             updated_at: modified_at(&target),
         });
@@ -939,6 +1138,8 @@ fn collect_local_sync_files(app: &AppHandle, directory: &Path, files: &mut Vec<L
         };
 
         files.push(LocalNoteSyncFile {
+            id: note.id.clone(),
+            sync_id: note.sync_id.clone(),
             title: note.name.clone(),
             path: note_path,
             relative_path: relative_sync_path(app, directory, &note.name)?,
@@ -1101,6 +1302,24 @@ async fn download_remote_file(client: &reqwest::Client, server_url: &str, api_ke
     response.data.ok_or_else(|| "Remote file response is empty".to_string())
 }
 
+async fn delete_remote_file(client: &reqwest::Client, server_url: &str, api_key: &str, file_id: &str) -> Result<(), String> {
+    let response = client
+        .post(format!("{server_url}/api/files/delete/{file_id}"))
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to delete remote file: {error}"))?
+        .json::<ServerApiResponse<()>>()
+        .await
+        .map_err(|error| format!("Failed to parse remote delete response: {error}"))?;
+
+    if !response.success {
+        return Err(response.message);
+    }
+
+    Ok(())
+}
+
 async fn upload_local_file(
     client: &reqwest::Client,
     server_url: &str,
@@ -1108,8 +1327,9 @@ async fn upload_local_file(
     local: &LocalNoteSyncFile,
     remote_id: Option<&str>,
 ) -> Result<ServerFileInfo, String> {
+    validate_sync_relative_path(&local.relative_path)?;
     let data = fs::read(&local.path).map_err(|error| format!("Failed to read local sync file: {error}"))?;
-    let file_name = sanitize_sync_file_name(&local.title);
+    let file_name = sync_upload_file_name(&local.relative_path, &local.title)?;
     let file_part = reqwest::multipart::Part::bytes(data)
         .file_name(file_name)
         .mime_str("text/markdown")
@@ -1144,6 +1364,7 @@ async fn upload_local_file(
 
 fn upsert_downloaded_note(app: &AppHandle, remote: &ServerFileInfo, content: &[u8]) -> Result<(), String> {
     let root = prepare_notes_workspace(app)?;
+    validate_sync_relative_path(&remote.relative_path)?;
     let relative_path = PathBuf::from(remote.relative_path.trim_start_matches("./"));
     let safe_relative = relative_path
         .components()
@@ -1165,6 +1386,10 @@ fn upsert_downloaded_note(app: &AppHandle, remote: &ServerFileInfo, content: &[u
 
     let mut index = read_directory_index(&directory)?;
     let existing = index.notes.iter().find_map(|record| {
+        if record.sync_id.as_deref() == Some(remote.id.as_str()) {
+            return Some(record.id.clone());
+        }
+
         let path = relative_sync_path(app, &directory, &record.name).ok()?;
         if path == remote.relative_path {
             Some(record.id.clone())
@@ -1179,10 +1404,12 @@ fn upsert_downloaded_note(app: &AppHandle, remote: &ServerFileInfo, content: &[u
 
     if let Some(record) = index.notes.iter_mut().find(|record| record.id == note_id) {
         record.name = title;
+        record.sync_id = Some(remote.id.clone());
         record.updated_at = modified_at(&note_path);
     } else {
         index.notes.push(NoteIndexRecord {
             id: note_id,
+            sync_id: Some(remote.id.clone()),
             name: title,
             updated_at: modified_at(&note_path),
         });
@@ -1565,6 +1792,7 @@ pub fn restore_backup(app: AppHandle, backup_path: String) -> Result<NoteDocumen
     } else {
         index.notes.push(NoteIndexRecord {
             id: note_id.clone(),
+            sync_id: None,
             name: sanitize_note_title(&item.note_title),
             updated_at: Some(
                 chrono::Local::now()
@@ -1600,6 +1828,9 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
 
     let mut local_files = Vec::new();
     collect_local_sync_files(&app, &root, &mut local_files)?;
+    cleanup_expired_deletions(&app, &root)?;
+    let mut local_deletions = Vec::new();
+    collect_local_deletions(&root, &mut local_deletions)?;
 
     let remote_files = list_remote_files(&client, &server_url, &api_key).await?;
     emit_debug_log(
@@ -1608,23 +1839,52 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
         "notes.sync.checked",
         format!("本地文件 {} 个，远端文件 {} 个", local_files.len(), remote_files.len()),
     );
-    let remote_by_path: HashMap<String, ServerFileInfo> = remote_files
+    let remote_active = remote_files
+        .iter()
+        .filter(|item| !item.is_deleted)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remote_deleted = remote_files
+        .iter()
+        .filter(|item| item.is_deleted)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remote_by_id: HashMap<String, ServerFileInfo> = remote_active
+        .iter()
+        .map(|item| (item.id.clone(), item.clone()))
+        .collect();
+    let remote_by_path: HashMap<String, ServerFileInfo> = remote_active
         .iter()
         .map(|item| (item.relative_path.clone(), item.clone()))
+        .collect();
+    let remote_deleted_by_id: HashMap<String, ServerFileInfo> = remote_deleted
+        .iter()
+        .map(|item| (item.id.clone(), item.clone()))
         .collect();
     let local_by_path: HashMap<String, LocalNoteSyncFile> = local_files
         .iter()
         .map(|item| (item.relative_path.clone(), item.clone()))
         .collect();
-
-    let download_candidates = remote_files
+    let local_by_sync_id: HashMap<String, LocalNoteSyncFile> = local_files
         .iter()
-        .filter(|remote| {
-            let remote_time = parse_rfc3339(&remote.last_updated);
-            match (last_synced_at, remote_time) {
-                (Some(last), Some(remote_at)) => remote_at > last,
-                (None, _) => true,
-                _ => false,
+        .filter_map(|item| item.sync_id.as_ref().map(|sync_id| (sync_id.clone(), item.clone())))
+        .collect();
+
+    let download_candidates = remote_active
+        .iter()
+        .filter(|remote| match local_by_sync_id
+            .get(&remote.id)
+            .or_else(|| local_by_path.get(&remote.relative_path))
+        {
+            Some(local) => parse_rfc3339(&remote.last_updated)
+                .is_some_and(|remote_at| remote_at > local.modified_at),
+            None => {
+                let remote_time = parse_rfc3339(&remote.last_updated);
+                match (last_synced_at, remote_time) {
+                    (Some(last), Some(remote_at)) => remote_at > last,
+                    (None, _) => true,
+                    _ => false,
+                }
             }
         })
         .cloned()
@@ -1632,9 +1892,28 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
 
     let upload_candidates = local_files
         .iter()
-        .filter(|local| match last_synced_at {
-            Some(last) => local.modified_at > last,
-            None => true,
+        .filter(|local| {
+            if local
+                .sync_id
+                .as_ref()
+                .is_some_and(|sync_id| remote_deleted_by_id.contains_key(sync_id))
+            {
+                return false;
+            }
+
+            let remote = local
+                .sync_id
+                .as_ref()
+                .and_then(|sync_id| remote_by_id.get(sync_id))
+                .or_else(|| remote_by_path.get(&local.relative_path));
+
+            match remote.and_then(|item| parse_rfc3339(&item.last_updated)) {
+                Some(remote_at) => local.modified_at > remote_at,
+                None => match last_synced_at {
+                    Some(last) => local.modified_at > last,
+                    None => true,
+                },
+            }
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1643,22 +1922,55 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
         &window,
         "checking",
         0,
-        download_candidates.len() + upload_candidates.len(),
+        download_candidates.len() + upload_candidates.len() + local_deletions.len() + remote_deleted.len(),
         format!(
-            "发现远端改动 {} 个，本地改动 {} 个",
+            "发现远端改动 {} 个，本地改动 {} 个，删除记录 {} 个",
             download_candidates.len(),
-            upload_candidates.len()
+            upload_candidates.len(),
+            local_deletions.len() + remote_deleted.len()
         ),
     );
 
     let mut downloaded = 0;
     let mut uploaded = 0;
     let mut skipped = 0;
-    let mut downloaded_paths = HashSet::new();
+    let mut deleted = 0;
+    let mut downloaded_ids = HashSet::new();
+
+    for deletion in local_deletions.iter() {
+        let Some(sync_id) = deletion.sync_id.as_deref() else {
+            skipped += 1;
+            continue;
+        };
+
+        if remote_deleted_by_id.contains_key(sync_id) {
+            skipped += 1;
+            continue;
+        }
+
+        if remote_by_id.contains_key(sync_id) {
+            delete_remote_file(&client, &server_url, &api_key, sync_id).await?;
+            deleted += 1;
+        }
+    }
+
+    for remote in remote_deleted.iter() {
+        if let Some(local) = local_by_sync_id
+            .get(&remote.id)
+            .or_else(|| local_by_path.get(&remote.relative_path))
+        {
+            let directory = note_directory_from_note_path(&local.path)?;
+            mark_local_note_deleted(&app, &directory, &local.id)?;
+            deleted += 1;
+        }
+    }
 
     for (index, remote) in download_candidates.iter().enumerate() {
         let remote_time = parse_rfc3339(&remote.last_updated);
-        if let (Some(local), Some(remote_at)) = (local_by_path.get(&remote.relative_path), remote_time) {
+        let local_match = local_by_sync_id
+            .get(&remote.id)
+            .or_else(|| local_by_path.get(&remote.relative_path));
+        if let (Some(local), Some(remote_at)) = (local_match, remote_time) {
             if local.modified_at > remote_at {
                 skipped += 1;
                 continue;
@@ -1676,11 +1988,15 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
         let content = download_remote_file(&client, &server_url, &api_key, &remote.id).await?;
         upsert_downloaded_note(&app, remote, &content)?;
         downloaded += 1;
-        downloaded_paths.insert(remote.relative_path.clone());
+        downloaded_ids.insert(remote.id.clone());
     }
 
     for (index, local) in upload_candidates.iter().enumerate() {
-        if downloaded_paths.contains(&local.relative_path) {
+        if local
+            .sync_id
+            .as_ref()
+            .is_some_and(|sync_id| downloaded_ids.contains(sync_id))
+        {
             skipped += 1;
             continue;
         }
@@ -1693,15 +2009,22 @@ pub async fn sync_notes(app: AppHandle, window: WebviewWindow) -> Result<NoteSyn
             format!("正在上传 {}", local.relative_path),
         );
 
-        let remote_id = remote_by_path.get(&local.relative_path).map(|item| item.id.as_str());
-        let _ = upload_local_file(&client, &server_url, &api_key, local, remote_id).await?;
+        let remote_id = local
+            .sync_id
+            .as_ref()
+            .and_then(|sync_id| remote_by_id.get(sync_id))
+            .or_else(|| remote_by_path.get(&local.relative_path))
+            .map(|item| item.id.as_str());
+        let uploaded_info = upload_local_file(&client, &server_url, &api_key, local, remote_id).await?;
+        let directory = note_directory_from_note_path(&local.path)?;
+        update_note_sync_id(&directory, &local.id, &uploaded_info.id)?;
         uploaded += 1;
     }
 
     let last_synced_at = now_rfc3339();
     write_sync_time(&app, &last_synced_at)?;
 
-    let message = format!("同步完成：下载 {downloaded} 个，上传 {uploaded} 个，跳过 {skipped} 个");
+    let message = format!("同步完成：下载 {downloaded} 个，上传 {uploaded} 个，删除 {deleted} 个，跳过 {skipped} 个");
     emit_debug_log(&app, "success", "notes.sync.done", message.clone());
     emit_sync_progress(&window, "done", downloaded + uploaded, downloaded + uploaded, &message);
 
@@ -1788,6 +2111,7 @@ pub fn create_note(
 
     index.notes.push(NoteIndexRecord {
         id: note_id,
+        sync_id: None,
         name: note_name.clone(),
         updated_at: modified_at(&note_path),
     });
@@ -1906,10 +2230,7 @@ pub fn delete_entry(app: AppHandle, path: String) -> Result<(), String> {
     if let Ok(target_note) = validate_note_path(&app, target_path) {
         let note_directory = note_directory_from_note_path(&target_note)?;
         let note_id = note_id_from_note_path(&target_note)?;
-        let mut index = read_directory_index(&note_directory)?;
-        index.notes.retain(|record| record.id != note_id);
-        write_directory_index(&note_directory, &index)?;
-        fs::remove_file(target_note).map_err(|error| format!("Failed to delete note: {error}"))?;
+        mark_local_note_deleted(&app, &note_directory, &note_id)?;
         return Ok(());
     }
 

@@ -101,13 +101,30 @@ const {
 } = storeToRefs(store)
 
 const NOTE_VDITOR_MODE_KEY = 'ai-markdown.notes.vditor-mode'
+const NOTES_SIDEBAR_WIDTH_KEY = 'ai-markdown.notes.sidebar-width'
+const NOTES_SIDEBAR_MIN_WIDTH = 220
+const NOTES_SIDEBAR_MAX_WIDTH = 460
 const batchUploadIcon = '<svg viewBox="0 0 24 24"><path d="M12 3v10m0-10 4 4m-4-4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 14v4a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 10h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
 const chartIcon = '<svg viewBox="0 0 24 24"><path d="M4 19V5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M4 19h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M8 16v-5m4 5V8m4 8v-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+
+function clampSidebarWidth(value: number) {
+  return Math.min(NOTES_SIDEBAR_MAX_WIDTH, Math.max(NOTES_SIDEBAR_MIN_WIDTH, value))
+}
+
+function getInitialSidebarWidth() {
+  const stored = Number(localStorage.getItem(NOTES_SIDEBAR_WIDTH_KEY))
+  return Number.isFinite(stored) && stored > 0 ? clampSidebarWidth(stored) : 280
+}
+
 const editorMode = ref<EditorMode>('write')
 const vditorMode = ref<VditorEditMode>((localStorage.getItem(NOTE_VDITOR_MODE_KEY) as VditorEditMode) || 'wysiwyg')
 const editorRef = ref<VditorEditorExpose | null>(null)
 const previewRef = ref<HTMLElement | null>(null)
 const sidebarCollapsed = ref(false)
+const sidebarWidth = ref(getInitialSidebarWidth())
+const sidebarResizing = ref(false)
+let sidebarResizeStartX = 0
+let sidebarResizeStartWidth = 0
 const noteTitleDraft = ref('')
 const renamingTitle = ref(false)
 const backupModalVisible = ref(false)
@@ -604,6 +621,45 @@ async function handleVditorUpload(files: File[]) {
 
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
+}
+
+function handleSidebarResizeMove(event: PointerEvent) {
+  if (!sidebarResizing.value) {
+    return
+  }
+
+  const delta = event.clientX - sidebarResizeStartX
+  sidebarWidth.value = clampSidebarWidth(sidebarResizeStartWidth + delta)
+}
+
+function stopSidebarResize() {
+  if (!sidebarResizing.value) {
+    return
+  }
+
+  sidebarResizing.value = false
+  localStorage.setItem(NOTES_SIDEBAR_WIDTH_KEY, String(sidebarWidth.value))
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  window.removeEventListener('pointermove', handleSidebarResizeMove)
+  window.removeEventListener('pointerup', stopSidebarResize)
+  window.removeEventListener('pointercancel', stopSidebarResize)
+}
+
+function startSidebarResize(event: PointerEvent) {
+  if (sidebarCollapsed.value) {
+    return
+  }
+
+  event.preventDefault()
+  sidebarResizing.value = true
+  sidebarResizeStartX = event.clientX
+  sidebarResizeStartWidth = sidebarWidth.value
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('pointermove', handleSidebarResizeMove)
+  window.addEventListener('pointerup', stopSidebarResize)
+  window.addEventListener('pointercancel', stopSidebarResize)
 }
 
 function normalizeSegmentText(text: string) {
@@ -1548,13 +1604,18 @@ onBeforeUnmount(() => {
     unlistenNoteSyncProgress()
     unlistenNoteSyncProgress = null
   }
+  stopSidebarResize()
   // 移除全局点击监听器
   document.removeEventListener('click', handleGlobalClick)
 })
 </script>
 
 <template>
-  <div class="notes-shell" :class="{ 'notes-shell--collapsed': sidebarCollapsed }">
+  <div
+    class="notes-shell"
+    :class="{ 'notes-shell--collapsed': sidebarCollapsed, 'notes-shell--resizing': sidebarResizing }"
+    :style="{ '--notes-sidebar-width': `${sidebarWidth}px` }"
+  >
     <TextContextMenu
       v-model="treeContextMenu.visible"
       :x="treeContextMenu.x"
@@ -1716,6 +1777,15 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </template>
+
+      <button
+        v-if="!sidebarCollapsed"
+        type="button"
+        class="notes-sidebar__resize-handle"
+        title="拖拽调整列表宽度"
+        aria-label="拖拽调整列表宽度"
+        @pointerdown="startSidebarResize"
+      />
     </aside>
 
     <main class="notes-main">
@@ -1910,11 +1980,16 @@ onBeforeUnmount(() => {
 /* 布局容器：去除多余的间隙，全屏网格 */
 .notes-shell {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: var(--notes-sidebar-width, 280px) 1fr;
   height: 100vh;
   background: var(--color-bg-app);
   transition: grid-template-columns 0.25s ease;
   overflow: hidden;
+}
+
+.notes-shell--resizing {
+  cursor: col-resize;
+  transition: none;
 }
 
 .notes-shell--collapsed {
@@ -1923,12 +1998,41 @@ onBeforeUnmount(() => {
 
 /* 侧边栏：纯白背景，右侧细线分割 */
 .notes-sidebar {
+  position: relative;
   background: var(--color-bg-sidebar);
   border-right: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
   transition: all 0.25s ease;
   z-index: 10;
+}
+
+.notes-sidebar__resize-handle {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  z-index: 12;
+  width: 8px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+}
+
+.notes-sidebar__resize-handle::after {
+  position: absolute;
+  top: 0;
+  right: 3px;
+  width: 2px;
+  height: 100%;
+  background: transparent;
+  content: '';
+  transition: background 0.18s ease;
+}
+
+.notes-sidebar__resize-handle:hover::after,
+.notes-shell--resizing .notes-sidebar__resize-handle::after {
+  background: rgba(37, 99, 235, 0.45);
 }
 
 /* 顶部工具栏：极简风格 */

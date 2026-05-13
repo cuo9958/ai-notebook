@@ -21,6 +21,50 @@ use uuid::Uuid;
 const CONFIG_FILE: &str = "config.toml";
 const DB_FILE: &str = "files.db";
 const DEFAULT_ROOT_DIR: &str = "./files";
+const DEFAULT_PORT: u16 = 3000;
+const MAX_STORAGE_FILE_NAME_BYTES: usize = 180;
+
+fn default_root_dir() -> String {
+    DEFAULT_ROOT_DIR.to_string()
+}
+
+fn default_port() -> u16 {
+    DEFAULT_PORT
+}
+
+fn validate_storage_file_name(value: &str) -> Result<String, String> {
+    let file_name = value.trim();
+    if file_name.is_empty() {
+        return Err("File name is empty".to_string());
+    }
+
+    if file_name.len() > MAX_STORAGE_FILE_NAME_BYTES {
+        return Err(format!("File name too long: {}", file_name));
+    }
+
+    if file_name.chars().any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()) {
+        return Err(format!("File name contains invalid characters: {}", file_name));
+    }
+
+    if file_name == "." || file_name == ".." || file_name.ends_with('.') {
+        return Err(format!("File name is invalid: {}", file_name));
+    }
+
+    Ok(file_name.to_string())
+}
+
+fn validate_relative_path(value: &str) -> Result<String, String> {
+    let relative_path = value.trim().trim_start_matches("./");
+    if relative_path.is_empty() || relative_path.starts_with('/') || relative_path.contains("..") {
+        return Err("Relative path is invalid".to_string());
+    }
+
+    for component in relative_path.split('/') {
+        validate_storage_file_name(component)?;
+    }
+
+    Ok(relative_path.to_string())
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -38,6 +82,7 @@ struct User {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 struct FileInfo {
     id: String,
     user_id: String,
@@ -48,6 +93,8 @@ struct FileInfo {
     mime_type: Option<String>,
     last_updated: String,
     version: u32,
+    is_deleted: bool,
+    deleted_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,8 +128,11 @@ struct UserConfig {
 
 #[derive(Deserialize)]
 struct ServerConfig {
+    #[serde(default = "default_root_dir")]
     root_dir: String,
+    #[serde(default = "default_port")]
     port: u16,
+    #[serde(default)]
     users: Vec<UserConfig>,
 }
 
@@ -102,9 +152,9 @@ fn load_or_create_config() -> ServerConfig {
         let content = format!(
             r#"[server]
 # 文件根目录，所有用户的文件都存放在此目录下
-root_dir = "./files"
+root_dir = "{}"
 # 服务监听端口
-port = 3000
+port = {}
 
 # 用户配置数组，必须命名为 server.users 才能被正确解析
 [[server.users]]
@@ -117,6 +167,8 @@ name = "user1"
 api_key = "{}"
 storage_path = "user1_files"
 "#,
+            DEFAULT_ROOT_DIR,
+            DEFAULT_PORT,
             admin_key,
             generate_api_key()
         );
@@ -164,6 +216,8 @@ fn init_db(db_path: &PathBuf) -> Connection {
             mime_type TEXT,
             last_updated TEXT NOT NULL,
             version INTEGER NOT NULL DEFAULT 1,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT,
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
 
@@ -172,6 +226,29 @@ fn init_db(db_path: &PathBuf) -> Connection {
         ",
     )
     .expect("Failed to create tables");
+
+    let existing_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(files)")
+            .expect("Failed to inspect files table");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("Failed to query files table columns")
+            .filter_map(|item| item.ok())
+            .collect()
+    };
+
+    if !existing_columns.iter().any(|column| column == "is_deleted") {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .expect("Failed to add is_deleted column");
+    }
+
+    if !existing_columns.iter().any(|column| column == "deleted_at") {
+        conn.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT", [])
+            .expect("Failed to add deleted_at column");
+    }
 
     info!("Database initialized at {:?}", db_path);
     conn
@@ -199,6 +276,11 @@ fn sync_users_from_config(conn: &Connection, users: &[UserConfig], root_dir: &Pa
                     ],
                 )
                 .ok();
+                let user_dir = root_dir.join(&user_config.storage_path);
+                if !user_dir.exists() {
+                    fs::create_dir_all(&user_dir)
+                        .expect(&format!("Failed to create user directory: {:?}", user_dir));
+                }
                 info!("Updated user config for: {}", user_config.name);
             }
             Err(_) => {
@@ -289,6 +371,16 @@ async fn upload_file(
         }
     };
 
+    let storage_dir = get_user_storage_dir(&state.root_dir, &user.storage_path);
+    if let Err(e) = tokio::fs::create_dir_all(&storage_dir).await {
+        error!("Failed to create user storage directory: {}", e);
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            message: format!("Failed to prepare user storage directory: {}", e),
+        });
+    }
+
     let mut relative_path_override: Option<String> = None;
     let mut last_updated_override: Option<String> = None;
 
@@ -298,7 +390,16 @@ async fn upload_file(
             if let Ok(value) = field.text().await {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
-                    relative_path_override = Some(trimmed.replace('\\', "/"));
+                    match validate_relative_path(trimmed) {
+                        Ok(relative_path) => relative_path_override = Some(relative_path),
+                        Err(message) => {
+                            return Json(ApiResponse {
+                                success: false,
+                                data: None,
+                                message,
+                            });
+                        }
+                    }
                 }
             }
             continue;
@@ -317,7 +418,16 @@ async fn upload_file(
             continue;
         }
 
-        let file_name = field.file_name().unwrap_or("unknown").to_string();
+        let file_name = match validate_storage_file_name(field.file_name().unwrap_or("unknown")) {
+            Ok(file_name) => file_name,
+            Err(message) => {
+                return Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    message,
+                });
+            }
+        };
         let content_type = field.content_type().map(|s| s.to_string());
 
         let data = match field.bytes().await {
@@ -333,9 +443,19 @@ async fn upload_file(
         };
 
         let file_size = data.len() as u64;
-        let file_uuid = Uuid::new_v4();
-        let stored_name = format!("{}/{}_{}", user.storage_path, file_uuid, file_name);
+        let relative_path = relative_path_override.clone().unwrap_or_else(|| file_name.clone());
+        let stored_name = format!("{}/{}", user.storage_path, relative_path);
         let file_path = state.root_dir.join(&stored_name);
+        if let Some(parent) = file_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                error!("Failed to create file directory: {}", e);
+                return Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    message: format!("Failed to prepare file directory: {}", e),
+                });
+            }
+        }
 
         if let Err(e) = tokio::fs::write(&file_path, &data).await {
             error!("Failed to write file: {}", e);
@@ -350,10 +470,6 @@ async fn upload_file(
         let now = last_updated_override
             .clone()
             .unwrap_or_else(|| Utc::now().to_rfc3339());
-        let relative_path = relative_path_override
-            .clone()
-            .unwrap_or_else(|| stored_name.clone());
-
         let file_info = FileInfo {
             id: file_id.clone(),
             user_id: user.id.clone(),
@@ -364,6 +480,8 @@ async fn upload_file(
             mime_type: content_type.clone(),
             last_updated: now.clone(),
             version: 1,
+            is_deleted: false,
+            deleted_at: None,
         };
 
         let db = state.db.clone();
@@ -378,7 +496,7 @@ async fn upload_file(
         tokio::task::spawn_blocking(move || {
             let conn = db.blocking_lock();
             let _ = conn.execute(
-                "INSERT INTO files (id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO files (id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version, is_deleted, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL)",
                 params![file_id_clone, user_id, file_name_clone, stored_name_clone, relative_path_clone, file_size, mime_type_clone, now_clone, 1u32],
             );
         }).await.unwrap();
@@ -429,7 +547,6 @@ async fn download_file(
         }
     };
 
-    let storage_dir = get_user_storage_dir(&state.root_dir, &user.storage_path);
     let db = state.db.clone();
     let file_id_clone = file_id.clone();
     let user_id_clone = user.id.clone();
@@ -437,7 +554,7 @@ async fn download_file(
     let res = tokio::task::spawn_blocking(move || {
         let conn = db.blocking_lock();
         let mut stmt = conn
-            .prepare("SELECT stored_name FROM files WHERE id = ?1 AND user_id = ?2")
+            .prepare("SELECT stored_name FROM files WHERE id = ?1 AND user_id = ?2 AND is_deleted = 0")
             .map_err(|e| e.to_string())?;
         let stored_name: String = stmt
             .query_row(params![file_id_clone, user_id_clone], |row| row.get(0))
@@ -502,7 +619,7 @@ async fn list_files(
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.blocking_lock();
         let mut stmt = conn.prepare(
-            "SELECT id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version FROM files WHERE user_id = ?1",
+            "SELECT id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version, is_deleted, deleted_at FROM files WHERE user_id = ?1",
         ).map_err(|e| e.to_string())?;
 
         let files: Vec<FileInfo> = stmt.query_map(params![user_id], |row| {
@@ -516,6 +633,8 @@ async fn list_files(
                 mime_type: row.get(6)?,
                 last_updated: row.get(7)?,
                 version: row.get(8)?,
+                is_deleted: row.get::<_, i64>(9)? != 0,
+                deleted_at: row.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -571,24 +690,38 @@ async fn update_file(
     };
 
     let storage_dir = get_user_storage_dir(&state.root_dir, &user.storage_path);
+    if let Err(e) = tokio::fs::create_dir_all(&storage_dir).await {
+        error!("Failed to create user storage directory: {}", e);
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            message: format!("Failed to prepare user storage directory: {}", e),
+        });
+    }
     let db = state.db.clone();
     let user_id = user.id.clone();
     let file_id_clone = file_id.clone();
 
-    let stored_name_result: Option<String> = tokio::task::spawn_blocking(move || {
+    let stored_file_result: Option<(String, String, String)> = tokio::task::spawn_blocking(move || {
         let conn = db.blocking_lock();
         conn.query_row(
-            "SELECT stored_name FROM files WHERE id = ?1 AND user_id = ?2",
+            "SELECT stored_name, original_name, relative_path FROM files WHERE id = ?1 AND user_id = ?2 AND is_deleted = 0",
             params![file_id_clone, user_id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .ok()
     })
     .await
     .unwrap();
 
-    let stored_name = match stored_name_result {
-        Some(name) => name,
+    let (stored_name, original_name, previous_relative_path) = match stored_file_result {
+        Some(file) => file,
         None => {
             return Json(ApiResponse {
                 success: false,
@@ -607,7 +740,16 @@ async fn update_file(
             if let Ok(value) = field.text().await {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
-                    relative_path_override = Some(trimmed.replace('\\', "/"));
+                    match validate_relative_path(trimmed) {
+                        Ok(relative_path) => relative_path_override = Some(relative_path),
+                        Err(message) => {
+                            return Json(ApiResponse {
+                                success: false,
+                                data: None,
+                                message,
+                            });
+                        }
+                    }
                 }
             }
             continue;
@@ -626,6 +768,16 @@ async fn update_file(
             continue;
         }
 
+        let file_name = match validate_storage_file_name(field.file_name().unwrap_or(&original_name)) {
+            Ok(file_name) => file_name,
+            Err(message) => {
+                return Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    message,
+                });
+            }
+        };
         let content_type = field.content_type().map(|s| s.to_string());
 
         let data = match field.bytes().await {
@@ -640,17 +792,25 @@ async fn update_file(
             }
         };
 
-        let old_path = state.root_dir.join(&stored_name);
-        let _ = tokio::fs::remove_file(&old_path).await;
-
-        let file_uuid = Uuid::new_v4();
-        let new_stored_name = format!(
-            "{}/{}_{}",
-            user.storage_path,
-            file_uuid,
-            stored_name.split('/').last().unwrap_or(&stored_name)
-        );
+        let relative_path = relative_path_override
+            .clone()
+            .unwrap_or_else(|| previous_relative_path.clone());
+        let new_stored_name = format!("{}/{}", user.storage_path, relative_path);
         let file_path = state.root_dir.join(&new_stored_name);
+        if stored_name != new_stored_name {
+            let old_path = state.root_dir.join(&stored_name);
+            let _ = tokio::fs::remove_file(&old_path).await;
+        }
+        if let Some(parent) = file_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                error!("Failed to create file directory: {}", e);
+                return Json(ApiResponse {
+                    success: false,
+                    data: None,
+                    message: format!("Failed to prepare file directory: {}", e),
+                });
+            }
+        }
 
         if let Err(e) = tokio::fs::write(&file_path, &data).await {
             error!("Failed to write file: {}", e);
@@ -664,9 +824,6 @@ async fn update_file(
         let now = last_updated_override
             .clone()
             .unwrap_or_else(|| Utc::now().to_rfc3339());
-        let relative_path = relative_path_override
-            .clone()
-            .unwrap_or_else(|| new_stored_name.clone());
         let file_size = data.len() as u64;
 
         let db_clone = state.db.clone();
@@ -676,8 +833,8 @@ async fn update_file(
         let _ = tokio::task::spawn_blocking(move || {
             let conn = db_clone.blocking_lock();
             let _ = conn.execute(
-                "UPDATE files SET stored_name = ?1, relative_path = ?2, size = ?3, mime_type = ?4, last_updated = ?5, version = version + 1 WHERE id = ?6 AND user_id = ?7",
-                params![new_stored_name, relative_path, file_size, content_type, now, file_id_for_update, user_id_for_update],
+                "UPDATE files SET original_name = ?8, stored_name = ?1, relative_path = ?2, size = ?3, mime_type = ?4, last_updated = ?5, version = version + 1, is_deleted = 0, deleted_at = NULL WHERE id = ?6 AND user_id = ?7",
+                params![new_stored_name, relative_path, file_size, content_type, now, file_id_for_update, user_id_for_update, file_name],
             );
         }).await;
 
@@ -688,7 +845,7 @@ async fn update_file(
         let updated_info = tokio::task::spawn_blocking(move || {
             let conn = db_for_select.blocking_lock();
             conn.query_row(
-                "SELECT id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version FROM files WHERE id = ?1 AND user_id = ?2",
+                "SELECT id, user_id, original_name, stored_name, relative_path, size, mime_type, last_updated, version, is_deleted, deleted_at FROM files WHERE id = ?1 AND user_id = ?2",
                 params![file_id_for_select, user_id_for_select],
                 |row| {
                     Ok(FileInfo {
@@ -701,6 +858,8 @@ async fn update_file(
                         mime_type: row.get(6)?,
                         last_updated: row.get(7)?,
                         version: row.get(8)?,
+                        is_deleted: row.get::<_, i64>(9)? != 0,
+                        deleted_at: row.get(10)?,
                     })
                 },
             ).ok()
@@ -762,25 +921,24 @@ async fn delete_file(
         }
     };
 
-    let storage_dir = get_user_storage_dir(&state.root_dir, &user.storage_path);
     let db = state.db.clone();
     let file_id_clone = file_id.clone();
     let user_id_clone = user.id.clone();
 
-    let stored_name: Option<String> = tokio::task::spawn_blocking(move || {
+    let file_record: Option<(String, String, String)> = tokio::task::spawn_blocking(move || {
         let conn = db.blocking_lock();
         conn.query_row(
-            "SELECT stored_name FROM files WHERE id = ?1 AND user_id = ?2",
+            "SELECT stored_name, relative_path, original_name FROM files WHERE id = ?1 AND user_id = ?2",
             params![file_id_clone, user_id_clone],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok()
     })
     .await
     .unwrap();
 
-    match stored_name {
-        Some(name) => {
+    match file_record {
+        Some((name, _relative_path, original_name)) => {
             let file_path = state.root_dir.join(&name);
             if let Err(e) = tokio::fs::remove_file(&file_path).await {
                 error!("Failed to delete file from disk: {}", e);
@@ -789,16 +947,17 @@ async fn delete_file(
             let db_clone = state.db.clone();
             let file_id_for_delete = file_id.clone();
             let user_id_for_delete = user.id.clone();
+            let now = Utc::now().to_rfc3339();
             let _ = tokio::task::spawn_blocking(move || {
                 let conn = db_clone.blocking_lock();
                 let _ = conn.execute(
-                    "DELETE FROM files WHERE id = ?1 AND user_id = ?2",
-                    params![file_id_for_delete, user_id_for_delete],
+                    "UPDATE files SET is_deleted = 1, deleted_at = ?1, last_updated = ?1, size = 0, version = version + 1 WHERE id = ?2 AND user_id = ?3",
+                    params![now, file_id_for_delete, user_id_for_delete],
                 );
             })
             .await;
 
-            info!("User {} deleted file: {}", user.name, name);
+            info!("User {} marked file deleted: {}", user.name, original_name);
         }
         None => {
             return Json(ApiResponse {
