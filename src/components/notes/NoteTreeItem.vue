@@ -13,6 +13,7 @@ const emit = defineEmits<{
   open: [path: string]
   createFolder: [parentPath: string]
   createNote: [parentPath: string]
+  move: [payload: { path: string; nodeType: NoteTreeNode['nodeType']; targetParentPath: string | null }]
   rename: [path: string, currentName: string]
   remove: [path: string, nodeType: NoteTreeNode['nodeType']]
   openMenu: [
@@ -27,10 +28,86 @@ const emit = defineEmits<{
 }>()
 
 const expanded = ref(true)
+const dragOver = ref(false)
 
 const currentDepth = computed(() => props.depth ?? 0)
 const isDirectory = computed(() => props.node.nodeType === 'directory')
 const isActive = computed(() => props.activePath === props.node.path)
+
+function dragPayload() {
+  return JSON.stringify({
+    path: props.node.path,
+    nodeType: props.node.nodeType,
+  })
+}
+
+function handleDragStart(event: DragEvent) {
+  event.stopPropagation()
+  event.dataTransfer?.setData('application/x-note-tree-node', dragPayload())
+  event.dataTransfer?.setData('text/plain', props.node.path)
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+  }
+}
+
+function handleDragOver(event: DragEvent) {
+  if (!isDirectory.value) {
+    event.stopPropagation()
+    return
+  }
+
+  event.preventDefault()
+  event.stopPropagation()
+  dragOver.value = true
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'move'
+  }
+}
+
+function handleDragLeave(event: DragEvent) {
+  if (!event.currentTarget || !event.relatedTarget) {
+    dragOver.value = false
+    return
+  }
+
+  const current = event.currentTarget as HTMLElement
+  const related = event.relatedTarget as Node
+  if (!current.contains(related)) {
+    dragOver.value = false
+  }
+}
+
+function handleDrop(event: DragEvent) {
+  if (!isDirectory.value) {
+    event.stopPropagation()
+    return
+  }
+
+  event.preventDefault()
+  event.stopPropagation()
+  dragOver.value = false
+
+  const raw = event.dataTransfer?.getData('application/x-note-tree-node')
+  if (!raw) {
+    return
+  }
+
+  try {
+    const payload = JSON.parse(raw) as { path?: string; nodeType?: NoteTreeNode['nodeType'] }
+    if (!payload.path || payload.path === props.node.path) {
+      return
+    }
+
+    emit('move', {
+      path: payload.path,
+      nodeType: payload.nodeType ?? 'file',
+      targetParentPath: props.node.path,
+    })
+    expanded.value = true
+  } catch {
+    // Ignore malformed drag payloads from outside the tree.
+  }
+}
 
 function forwardRename(path: string, currentName: string) {
   emit('rename', path, currentName)
@@ -60,8 +137,15 @@ function handleContextMenu(event: MouseEvent) {
     :class="{
       'tree-item--directory': isDirectory,
       'tree-item--file': !isDirectory,
+      'tree-item--drag-over': dragOver,
     }"
     :style="{ '--depth': currentDepth }"
+    draggable="true"
+    @dragstart="handleDragStart"
+    @dragover="handleDragOver"
+    @dragleave="handleDragLeave"
+    @drop="handleDrop"
+    @dragend="dragOver = false"
   >
     <div
       class="tree-item__row"
@@ -103,6 +187,7 @@ function handleContextMenu(event: MouseEvent) {
         @rename="forwardRename"
         @remove="forwardRemove"
         @open-menu="emit('openMenu', $event)"
+        @move="emit('move', $event)"
       />
     </div>
   </div>
@@ -124,6 +209,11 @@ function handleContextMenu(event: MouseEvent) {
 
 .tree-item--file {
   margin-left: calc(var(--depth, 0) * 12px);
+}
+
+.tree-item--drag-over > .tree-item__row {
+  background: #e0ecff;
+  outline: 1px solid #93c5fd;
 }
 
 .tree-item__row {

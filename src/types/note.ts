@@ -20,6 +20,10 @@ export interface NoteSaveResult {
   lastBackupAt: string | null
 }
 
+export interface MoveEntryResult {
+  path: string
+}
+
 export interface NoteImageAsset {
   filePath: string
   markdownPath: string

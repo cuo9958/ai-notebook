@@ -16,8 +16,8 @@
         "title": "易笔记",
         "width": 1440,
         "height": 920,
-        "minWidth": 1200,
-        "minHeight": 760,
+        "minWidth": 960,
+        "minHeight": 620,
         "resizable": true,
         "fullscreen": false,
         "center": true

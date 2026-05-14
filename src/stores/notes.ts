@@ -5,6 +5,7 @@ import {
   createNote,
   deleteEntry,
   listNotes,
+  moveEntry,
   readNote,
   renameEntry,
   saveNote,
@@ -202,6 +203,28 @@ export const useNotesStore = defineStore('notes', () => {
     }
   }
 
+  async function moveNode(
+    path: string,
+    targetParentPath: string | null,
+    nodeType: NoteTreeNode['nodeType'] = 'file',
+  ) {
+    cancelAutoSave()
+    const currentActivePath = activeNote.value?.path ?? ''
+    const isActiveMoved = currentActivePath === path
+    const activePathIsInsideMovedDirectory = nodeType === 'directory'
+      && Boolean(currentActivePath)
+      && currentActivePath.startsWith(`${path}/`)
+    const result = await moveEntry(path, targetParentPath)
+
+    await refreshTree()
+
+    if (isActiveMoved) {
+      await openNote(result.path)
+    } else if (activePathIsInsideMovedDirectory) {
+      await openNote(`${result.path}${currentActivePath.slice(path.length)}`)
+    }
+  }
+
   async function removeNode(path: string) {
     cancelAutoSave()
     await deleteEntry(path)
@@ -263,6 +286,7 @@ export const useNotesStore = defineStore('notes', () => {
     queueAutoSave,
     refreshTree,
     removeNode,
+    moveNode,
     renameNode,
     rootPath,
     saveActiveNote,

@@ -60,6 +60,12 @@ pub struct NoteSaveResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MoveEntryResult {
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NoteImageAsset {
     file_path: String,
     markdown_path: String,
@@ -112,6 +118,7 @@ struct LocalNoteSyncFile {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct ServerFileInfo {
     id: String,
     original_name: String,
@@ -616,6 +623,57 @@ fn write_directory_index(directory: &Path, index: &NoteDirectoryIndex) -> Result
         .map_err(|error| format!("Failed to save note index: {error}"))
 }
 
+fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_type = entry.file_type()?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+
+        if entry_type.is_dir() {
+            copy_dir_all(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn touch_file(path: &Path) -> Result<(), String> {
+    let content = fs::read(path).map_err(|error| format!("Failed to read moved note: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("Failed to update moved note timestamp: {error}"))
+}
+
+fn touch_directory_notes(directory: &Path) -> Result<(), String> {
+    ensure_directory_storage(directory)?;
+
+    for entry in fs::read_dir(directory).map_err(|error| format!("Failed to read moved directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("Failed to read moved directory entry: {error}"))?;
+        let entry_path = entry.path();
+
+        if is_reserved_entry(&entry_path) {
+            continue;
+        }
+
+        if entry_path.is_dir() {
+            touch_directory_notes(&entry_path)?;
+        }
+    }
+
+    let index = read_directory_index(directory)?;
+    for record in index.notes {
+        let note_path = note_content_path(directory, &record.id);
+        if note_path.exists() {
+            touch_file(&note_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn sanitize_note_title(value: &str) -> String {
     let trimmed = value.trim().trim_end_matches(".md").trim();
     if trimmed.is_empty() {
@@ -677,6 +735,29 @@ fn unique_note_name(index: &NoteDirectoryIndex, desired: &str, current_id: Optio
     }
 
     format!("{base}-{}", Uuid::new_v4().simple())
+}
+
+fn unique_directory_path(parent: &Path, desired_name: &str) -> PathBuf {
+    let base = sanitize_backup_name(desired_name);
+    let base = if base.is_empty() {
+        "Untitled Folder".to_string()
+    } else {
+        base
+    };
+    let candidate = parent.join(&base);
+
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    for number in 1..1000 {
+        let next = parent.join(format!("{base}-{number}"));
+        if !next.exists() {
+            return next;
+        }
+    }
+
+    parent.join(format!("{base}-{}", Uuid::new_v4().simple()))
 }
 
 fn note_directory_from_note_path(note_path: &Path) -> Result<PathBuf, String> {
@@ -850,6 +931,45 @@ fn update_note_sync_id(directory: &Path, note_id: &str, sync_id: &str) -> Result
         record.sync_id = Some(sync_id.to_string());
         write_directory_index(directory, &index)?;
     }
+    Ok(())
+}
+
+fn mark_directory_moved_for_sync(app: &AppHandle, directory: &Path) -> Result<(), String> {
+    ensure_directory_storage(directory)?;
+
+    for entry in fs::read_dir(directory).map_err(|error| format!("Failed to read move directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("Failed to read move directory entry: {error}"))?;
+        let entry_path = entry.path();
+
+        if is_reserved_entry(&entry_path) {
+            continue;
+        }
+
+        if entry_path.is_dir() {
+            mark_directory_moved_for_sync(app, &entry_path)?;
+        }
+    }
+
+    let mut index = read_directory_index(directory)?;
+    let deleted_at = now_rfc3339();
+    let mut deleted = Vec::new();
+
+    for record in index.notes.iter_mut() {
+        if let Some(sync_id) = record.sync_id.take() {
+            deleted.push(NoteDeletionRecord {
+                id: record.id.clone(),
+                sync_id: Some(sync_id),
+                relative_path: relative_sync_path(app, directory, &record.name)?,
+                deleted_at: deleted_at.clone(),
+            });
+        }
+    }
+
+    if !deleted.is_empty() {
+        index.deleted.extend(deleted);
+        write_directory_index(directory, &index)?;
+    }
+
     Ok(())
 }
 
@@ -1272,10 +1392,16 @@ async fn list_remote_files(client: &reqwest::Client, server_url: &str, api_key: 
         .header("X-API-Key", api_key)
         .send()
         .await
-        .map_err(|error| format!("Failed to request remote file list: {error}"))?
-        .json::<ServerApiResponse<Vec<ServerFileInfo>>>()
+        .map_err(|error| format!("Failed to request remote file list: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
         .await
-        .map_err(|error| format!("Failed to parse remote file list: {error}"))?;
+        .map_err(|error| format!("Failed to read remote file list: {error}"))?;
+    let response: ServerApiResponse<Vec<ServerFileInfo>> = serde_json::from_str(&body).map_err(|error| {
+        let preview: String = body.chars().take(500).collect();
+        format!("Failed to parse remote file list: status {status}, {error}, body: {preview}")
+    })?;
 
     if !response.success {
         return Err(response.message);
@@ -2220,6 +2346,122 @@ pub fn rename_entry(app: AppHandle, path: String, new_name: String) -> Result<()
     let next = parent.join(new_name.trim());
     fs::rename(target_directory, next).map_err(|error| format!("Failed to rename entry: {error}"))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn move_entry(
+    app: AppHandle,
+    path: String,
+    target_parent_path: Option<String>,
+) -> Result<MoveEntryResult, String> {
+    let root = prepare_notes_workspace(&app)?;
+    let target_parent = match target_parent_path {
+        Some(path) => validate_directory_path(&app, Path::new(&path))?,
+        None => root,
+    };
+
+    let source_path = Path::new(&path);
+
+    if let Ok(source_note) = validate_note_path(&app, source_path) {
+        let source_directory = note_directory_from_note_path(&source_note)?;
+        let source_note_id = note_id_from_note_path(&source_note)?;
+        let target_directory = canonical_path(&target_parent)?;
+
+        if canonical_path(&source_directory)? == target_directory {
+            return Ok(MoveEntryResult {
+                path: display_path(&source_note),
+            });
+        }
+
+        ensure_directory_storage(&target_directory)?;
+
+        let mut source_index = read_directory_index(&source_directory)?;
+        let Some(position) = source_index
+            .notes
+            .iter()
+            .position(|record| record.id == source_note_id)
+        else {
+            return Err("Failed to find note in source directory".to_string());
+        };
+
+        let mut record = source_index.notes.remove(position);
+        if let Some(sync_id) = record.sync_id.take() {
+            source_index.deleted.push(NoteDeletionRecord {
+                id: record.id.clone(),
+                sync_id: Some(sync_id),
+                relative_path: relative_sync_path(&app, &source_directory, &record.name)?,
+                deleted_at: now_rfc3339(),
+            });
+        }
+        write_directory_index(&source_directory, &source_index)?;
+
+        let mut target_index = read_directory_index(&target_directory)?;
+        record.name = unique_note_name(&target_index, &record.name, None);
+        let target_note = note_content_path(&target_directory, &record.id);
+        fs::rename(&source_note, &target_note).or_else(|_| {
+            fs::copy(&source_note, &target_note)?;
+            fs::remove_file(&source_note)
+        }).map_err(|error| format!("Failed to move note: {error}"))?;
+
+        let source_asset_dir = note_asset_dir(&source_directory, &record.id);
+        if source_asset_dir.exists() {
+            let target_asset_dir = note_asset_dir(&target_directory, &record.id);
+            if let Some(parent) = target_asset_dir.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Failed to prepare note asset directory: {error}"))?;
+            }
+            let _ = fs::remove_dir_all(&target_asset_dir);
+            fs::rename(&source_asset_dir, &target_asset_dir).or_else(|_| {
+                copy_dir_all(&source_asset_dir, &target_asset_dir)?;
+                fs::remove_dir_all(&source_asset_dir)
+            }).map_err(|error| format!("Failed to move note assets: {error}"))?;
+        }
+
+        touch_file(&target_note)?;
+        record.updated_at = modified_at(&target_note);
+        target_index.notes.push(record);
+        write_directory_index(&target_directory, &target_index)?;
+
+        return Ok(MoveEntryResult {
+            path: display_path(&target_note),
+        });
+    }
+
+    let source_directory = validate_directory_path(&app, source_path)?;
+    let source_directory = canonical_path(&source_directory)?;
+    let target_parent = canonical_path(&target_parent)?;
+
+    if source_directory == target_parent {
+        return Err("Cannot move a directory into itself".to_string());
+    }
+
+    if target_parent.starts_with(&source_directory) {
+        return Err("Cannot move a directory into its child directory".to_string());
+    }
+
+    if source_directory
+        .parent()
+        .is_some_and(|parent| parent == target_parent)
+    {
+        return Ok(MoveEntryResult {
+            path: display_path(&source_directory),
+        });
+    }
+
+    let directory_name = source_directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Failed to resolve directory name".to_string())?;
+    let target_directory = unique_directory_path(&target_parent, directory_name);
+
+    mark_directory_moved_for_sync(&app, &source_directory)?;
+    fs::rename(&source_directory, &target_directory)
+        .map_err(|error| format!("Failed to move directory: {error}"))?;
+    touch_directory_notes(&target_directory)?;
+
+    Ok(MoveEntryResult {
+        path: display_path(&target_directory),
+    })
 }
 
 #[tauri::command]

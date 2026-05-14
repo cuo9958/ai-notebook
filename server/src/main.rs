@@ -70,15 +70,14 @@ fn validate_relative_path(value: &str) -> Result<String, String> {
 struct AppState {
     root_dir: PathBuf,
     db: Arc<Mutex<Connection>>,
+    users: Arc<Vec<UserConfig>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct User {
     id: String,
     name: String,
-    api_key: String,
     storage_path: String,
-    created_at: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -114,12 +113,15 @@ struct FileListQuery {
 
 #[derive(Deserialize)]
 struct CreateUserRequest {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     api_key: Option<String>,
+    #[allow(dead_code)]
     storage_path: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct UserConfig {
     name: String,
     api_key: String,
@@ -201,7 +203,6 @@ fn init_db(db_path: &PathBuf) -> Connection {
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
-            api_key TEXT UNIQUE NOT NULL,
             storage_path TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -222,10 +223,11 @@ fn init_db(db_path: &PathBuf) -> Connection {
         );
 
         CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);
-        CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
         ",
     )
     .expect("Failed to create tables");
+
+    remove_api_keys_from_users_table(&conn);
 
     let existing_columns: Vec<String> = {
         let mut stmt = conn
@@ -254,6 +256,43 @@ fn init_db(db_path: &PathBuf) -> Connection {
     conn
 }
 
+fn remove_api_keys_from_users_table(conn: &Connection) {
+    let user_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(users)")
+            .expect("Failed to inspect users table");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("Failed to query users table columns")
+            .filter_map(|item| item.ok())
+            .collect()
+    };
+
+    if !user_columns.iter().any(|column| column == "api_key") {
+        return;
+    }
+
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        DROP INDEX IF EXISTS idx_users_api_key;
+        CREATE TABLE users_without_api_key (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            storage_path TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO users_without_api_key (id, name, storage_path, created_at)
+            SELECT id, name, storage_path, created_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_without_api_key RENAME TO users;
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+    .expect("Failed to remove api_key from users table");
+
+    info!("Removed api_key column from users table; API keys are now loaded from config.toml only");
+}
+
 fn sync_users_from_config(conn: &Connection, users: &[UserConfig], root_dir: &PathBuf) {
     let now = Utc::now().to_rfc3339();
 
@@ -266,14 +305,9 @@ fn sync_users_from_config(conn: &Connection, users: &[UserConfig], root_dir: &Pa
             |row| row.get::<_, String>(0),
         ) {
             Ok(_) => {
-                // 用户已存在，更新 api_key 和 storage_path
                 conn.execute(
-                    "UPDATE users SET api_key = ?1, storage_path = ?2 WHERE name = ?3",
-                    params![
-                        user_config.api_key,
-                        user_config.storage_path,
-                        user_config.name
-                    ],
+                    "UPDATE users SET storage_path = ?1 WHERE name = ?2",
+                    params![user_config.storage_path, user_config.name],
                 )
                 .ok();
                 let user_dir = root_dir.join(&user_config.storage_path);
@@ -286,8 +320,8 @@ fn sync_users_from_config(conn: &Connection, users: &[UserConfig], root_dir: &Pa
             Err(_) => {
                 // 用户不存在，创建新用户
                 conn.execute(
-                    "INSERT INTO users (id, name, api_key, storage_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![user_id, user_config.name, user_config.api_key, user_config.storage_path, now],
+                    "INSERT INTO users (id, name, storage_path, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![user_id, user_config.name, user_config.storage_path, now],
                 ).ok();
 
                 // 创建用户专属目录
@@ -305,21 +339,15 @@ fn sync_users_from_config(conn: &Connection, users: &[UserConfig], root_dir: &Pa
     }
 }
 
-fn authenticate_user(conn: &Connection, api_key: &str) -> Option<User> {
-    conn.query_row(
-        "SELECT id, name, api_key, storage_path, created_at FROM users WHERE api_key = ?1",
-        params![api_key],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                api_key: row.get(2)?,
-                storage_path: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        },
-    )
-    .ok()
+fn authenticate_user(users: &[UserConfig], api_key: &str) -> Option<User> {
+    users
+        .iter()
+        .find(|user| user.api_key == api_key)
+        .map(|user| User {
+            id: user.name.clone(),
+            name: user.name.clone(),
+            storage_path: user.storage_path.clone(),
+        })
 }
 
 fn get_user_storage_dir(root_dir: &PathBuf, storage_path: &str) -> PathBuf {
@@ -334,14 +362,7 @@ fn get_api_key(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn get_user_from_key(state: &AppState, api_key: &str) -> Option<User> {
-    let db = state.db.clone();
-    let api_key_clone = api_key.to_string();
-    tokio::task::spawn_blocking(move || {
-        let conn = db.blocking_lock();
-        authenticate_user(&conn, &api_key_clone)
-    })
-    .await
-    .unwrap()
+    authenticate_user(&state.users, api_key)
 }
 
 async fn upload_file(
@@ -978,7 +999,7 @@ async fn delete_file(
 async fn create_user(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<CreateUserRequest>,
+    Json(_req): Json<CreateUserRequest>,
 ) -> Json<ApiResponse<User>> {
     let api_key = match get_api_key(&headers) {
         Some(key) => key,
@@ -1004,61 +1025,11 @@ async fn create_user(
         });
     }
 
-    let user_api_key = req.api_key.unwrap_or_else(|| generate_api_key());
-    let storage_path = req
-        .storage_path
-        .unwrap_or_else(|| format!("user_{}", req.name));
-    let user_id = req.name.clone();
-    let created_at = Utc::now().to_rfc3339();
-
-    let db = state.db.clone();
-    let user_id_clone = user_id.clone();
-    let req_name = req.name.clone();
-    let storage_path_clone = storage_path.clone();
-    let root_dir = state.root_dir.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = db.blocking_lock();
-
-        match conn.execute(
-            "INSERT OR REPLACE INTO users (id, name, api_key, storage_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user_id_clone, req_name, user_api_key, storage_path_clone, created_at],
-        ) {
-            Ok(_) => {
-                let user_dir = get_user_storage_dir(&root_dir, &storage_path_clone);
-                if !user_dir.exists() {
-                    fs::create_dir_all(&user_dir).expect("Failed to create user directory");
-                }
-
-                Ok(User {
-                    id: user_id_clone.clone(),
-                    name: req_name.clone(),
-                    api_key: user_api_key.clone(),
-                    storage_path: storage_path_clone.clone(),
-                    created_at: created_at.clone(),
-                })
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }).await;
-
-    match result {
-        Ok(Ok(user)) => Json(ApiResponse {
-            success: true,
-            data: Some(user),
-            message: "User created successfully".to_string(),
-        }),
-        Ok(Err(e)) => Json(ApiResponse {
-            success: false,
-            data: None,
-            message: format!("Failed to create user: {}", e),
-        }),
-        Err(_) => Json(ApiResponse {
-            success: false,
-            data: None,
-            message: "Internal error".to_string(),
-        }),
-    }
+    Json(ApiResponse {
+        success: false,
+        data: None,
+        message: "Users and API keys are managed in config.toml; edit [[server.users]] and restart the server".to_string(),
+    })
 }
 
 async fn list_users(
@@ -1089,43 +1060,21 @@ async fn list_users(
         });
     }
 
-    let db = state.db.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = db.blocking_lock();
-        let mut stmt = conn
-            .prepare("SELECT id, name, api_key, storage_path, created_at FROM users")
-            .map_err(|e| e.to_string())?;
+    let users = state
+        .users
+        .iter()
+        .map(|user| User {
+            id: user.name.clone(),
+            name: user.name.clone(),
+            storage_path: user.storage_path.clone(),
+        })
+        .collect();
 
-        let users: Vec<User> = stmt
-            .query_map([], |row| {
-                Ok(User {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    api_key: row.get(2)?,
-                    storage_path: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok::<_, String>(users)
+    Json(ApiResponse {
+        success: true,
+        data: Some(users),
+        message: "Users listed from config.toml".to_string(),
     })
-    .await;
-
-    match result {
-        Ok(Ok(users)) => Json(ApiResponse {
-            success: true,
-            data: Some(users),
-            message: "Users listed successfully".to_string(),
-        }),
-        _ => Json(ApiResponse {
-            success: false,
-            data: None,
-            message: "Failed to list users".to_string(),
-        }),
-    }
 }
 
 #[tokio::main]
@@ -1155,6 +1104,7 @@ async fn main() {
     let state = AppState {
         root_dir,
         db: Arc::new(Mutex::new(conn)),
+        users: Arc::new(server_config.users.clone()),
     };
 
     let cors = CorsLayer::new()

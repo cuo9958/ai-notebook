@@ -116,6 +116,25 @@ function getInitialSidebarWidth() {
   return Number.isFinite(stored) && stored > 0 ? clampSidebarWidth(stored) : 280
 }
 
+function getErrorMessage(err: unknown, fallback: string) {
+  if (typeof err === 'string') {
+    return err
+  }
+
+  if (err instanceof Error) {
+    return err.message
+  }
+
+  if (err && typeof err === 'object' && 'message' in err) {
+    const message = (err as { message?: unknown }).message
+    if (typeof message === 'string') {
+      return message
+    }
+  }
+
+  return fallback
+}
+
 const editorMode = ref<EditorMode>('write')
 const vditorMode = ref<VditorEditMode>((localStorage.getItem(NOTE_VDITOR_MODE_KEY) as VditorEditMode) || 'wysiwyg')
 const editorRef = ref<VditorEditorExpose | null>(null)
@@ -202,6 +221,7 @@ const dialogState = reactive({
 const noteSyncing = ref(false)
 const noteSyncProgress = ref<NoteSyncProgress | null>(null)
 const noteSyncResult = ref<NoteSyncResult | null>(null)
+const rootDragOver = ref(false)
 let noteSyncTimer: ReturnType<typeof setInterval> | null = null
 let unlistenNoteSyncProgress: (() => void) | null = null
 
@@ -722,6 +742,65 @@ function openTreeContextMenu(payload: {
   treeContextMenu.path = payload.path
   treeContextMenu.name = payload.name
   treeContextMenu.nodeType = payload.nodeType
+}
+
+function readDraggedTreeNode(event: DragEvent) {
+  const raw = event.dataTransfer?.getData('application/x-note-tree-node')
+  if (!raw) {
+    return null
+  }
+
+  try {
+    const payload = JSON.parse(raw) as { path?: string; nodeType?: 'directory' | 'file' }
+    return payload.path ? payload : null
+  } catch {
+    return null
+  }
+}
+
+function handleTreeMove(payload: { path: string; nodeType?: 'directory' | 'file'; targetParentPath: string | null }) {
+  void store.moveNode(payload.path, payload.targetParentPath, payload.nodeType ?? 'file').catch((err) => {
+    error.value = getErrorMessage(err, '移动笔记失败')
+  })
+}
+
+function handleRootDragOver(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes('application/x-note-tree-node')) {
+    return
+  }
+
+  event.preventDefault()
+  rootDragOver.value = true
+  event.dataTransfer.dropEffect = 'move'
+}
+
+function handleRootDragLeave(event: DragEvent) {
+  if (!event.currentTarget || !event.relatedTarget) {
+    rootDragOver.value = false
+    return
+  }
+
+  const current = event.currentTarget as HTMLElement
+  const related = event.relatedTarget as Node
+  if (!current.contains(related)) {
+    rootDragOver.value = false
+  }
+}
+
+function handleRootDrop(event: DragEvent) {
+  event.preventDefault()
+  rootDragOver.value = false
+
+  const payload = readDraggedTreeNode(event)
+  if (!payload?.path) {
+    return
+  }
+
+  handleTreeMove({
+    path: payload.path,
+    nodeType: payload.nodeType,
+    targetParentPath: null,
+  })
 }
 
 function handlePreviewContextMenu(event: MouseEvent) {
@@ -1739,7 +1818,14 @@ onBeforeUnmount(() => {
       </div>
 
       <template v-if="!sidebarCollapsed">
-        <div class="notes-tree">
+        <div
+          class="notes-tree"
+          :class="{ 'notes-tree--drag-over': rootDragOver }"
+          @dragover="handleRootDragOver"
+          @dragleave="handleRootDragLeave"
+          @drop="handleRootDrop"
+          @dragend="rootDragOver = false"
+        >
           <p v-if="!tree.length && !loading" class="empty-tip">当前工作区还没有笔记，先创建一篇开始吧。</p>
 
           <NoteTreeItem
@@ -1753,6 +1839,7 @@ onBeforeUnmount(() => {
             @rename="promptRename"
             @remove="confirmRemove"
             @open-menu="openTreeContextMenu"
+            @move="handleTreeMove"
           />
         </div>
 
@@ -2100,6 +2187,13 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+
+.notes-tree--drag-over {
+  border-color: #93c5fd;
+  background: #eff6ff;
 }
 
 /* 树节点优化（通过样式穿透或直接在组件中调整，这里假设使用 NoteTreeItem） */

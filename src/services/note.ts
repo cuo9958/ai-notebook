@@ -4,6 +4,7 @@ import type {
   BackupHistoryItem,
   BackupSettings,
   NoteDocument,
+  MoveEntryResult,
   NoteSaveResult,
   NoteImageAsset,
   NoteSyncResult,
@@ -42,6 +43,10 @@ export function saveNoteImage(path: string, fileName: string, data: number[]): P
 
 export function renameEntry(path: string, newName: string): Promise<void> {
   return loggedInvoke('rename_entry', { path, newName })
+}
+
+export function moveEntry(path: string, targetParentPath: string | null): Promise<MoveEntryResult> {
+  return loggedInvoke('move_entry', { path, targetParentPath })
 }
 
 export function deleteEntry(path: string): Promise<void> {

@@ -2,8 +2,21 @@ mod mail;
 mod notes;
 mod writing;
 
+const MAIN_WINDOW_LABEL: &str = "main";
 const DEBUG_LOG_WINDOW_LABEL: &str = "debug-log-window";
 const DEBUG_LOG_FILE_NAME: &str = "debug.log";
+const SMALL_SCREEN_WIDTH: f64 = 1440.0;
+const SMALL_SCREEN_HEIGHT: f64 = 900.0;
+const LARGE_SCREEN_WIDTH: f64 = 2400.0;
+const LARGE_SCREEN_HEIGHT: f64 = 1350.0;
+const DEFAULT_SCREEN_RATIO: f64 = 0.80;
+const SMALL_SCREEN_RATIO: f64 = 0.86;
+const LARGE_SCREEN_RATIO: f64 = 0.76;
+const MIN_WINDOW_WIDTH: f64 = 960.0;
+const MIN_WINDOW_HEIGHT: f64 = 620.0;
+const MAX_WINDOW_WIDTH: f64 = 1680.0;
+const MAX_WINDOW_HEIGHT: f64 = 1050.0;
+const SCREEN_MARGIN: f64 = 32.0;
 
 #[tauri::command]
 fn open_debug_devtools(_window: tauri::WebviewWindow) {
@@ -21,6 +34,73 @@ fn debug_log_file_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
     let dir = app.path().app_log_dir().map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir.join(DEBUG_LOG_FILE_NAME))
+}
+
+fn target_window_ratio(width: f64, height: f64) -> f64 {
+    if width <= SMALL_SCREEN_WIDTH || height <= SMALL_SCREEN_HEIGHT {
+        SMALL_SCREEN_RATIO
+    } else if width >= LARGE_SCREEN_WIDTH && height >= LARGE_SCREEN_HEIGHT {
+        LARGE_SCREEN_RATIO
+    } else {
+        DEFAULT_SCREEN_RATIO
+    }
+}
+
+fn clamp_window_dimension(value: f64, min: f64, max: f64, available: f64) -> f64 {
+    let upper_bound = (available - SCREEN_MARGIN).max(available * DEFAULT_SCREEN_RATIO);
+    value.clamp(min.min(upper_bound), max.min(upper_bound)).round()
+}
+
+fn initial_window_size(monitor: &tauri::Monitor) -> (f64, f64) {
+    let scale_factor = monitor.scale_factor();
+    let work_area = monitor.work_area();
+    let available_width = work_area.size.width as f64 / scale_factor;
+    let available_height = work_area.size.height as f64 / scale_factor;
+    let ratio = target_window_ratio(available_width, available_height);
+
+    (
+        clamp_window_dimension(
+            available_width * ratio,
+            MIN_WINDOW_WIDTH,
+            MAX_WINDOW_WIDTH,
+            available_width,
+        ),
+        clamp_window_dimension(
+            available_height * ratio,
+            MIN_WINDOW_HEIGHT,
+            MAX_WINDOW_HEIGHT,
+            available_height,
+        ),
+    )
+}
+
+fn fit_min_window_size(width: f64, height: f64) -> (f64, f64) {
+    (
+        MIN_WINDOW_WIDTH.min(width).round(),
+        MIN_WINDOW_HEIGHT.min(height).round(),
+    )
+}
+
+fn apply_initial_window_size(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::{LogicalSize, Manager};
+
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let monitor = match window.current_monitor()? {
+            Some(monitor) => Some(monitor),
+            None => window.primary_monitor()?,
+        };
+
+        if let Some(monitor) = monitor {
+            let (width, height) = initial_window_size(&monitor);
+            let (min_width, min_height) = fit_min_window_size(width, height);
+
+            window.set_min_size(Some(LogicalSize::new(min_width, min_height)))?;
+            window.set_size(LogicalSize::new(width, height))?;
+            window.center()?;
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -121,6 +201,7 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            apply_initial_window_size(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -159,6 +240,7 @@ pub fn run() {
             notes::list_notes,
             notes::read_note,
             notes::rename_entry,
+            notes::move_entry,
             notes::save_note,
             notes::save_note_image,
             writing::list_writing_projects,
