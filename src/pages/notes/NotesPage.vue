@@ -26,6 +26,8 @@ import {
 } from '@lucide/vue'
 import mermaid from 'mermaid'
 import { storeToRefs } from 'pinia'
+import { VueDraggable } from 'vue-draggable-plus'
+import type { MoveEvent, SortableEvent } from 'vue-draggable-plus'
 import AINoteEditModal from '@/components/ai/AINoteEditModal.vue'
 import TextContextMenu from '@/components/common/TextContextMenu.vue'
 import VditorEditor from '@/components/common/VditorEditor.vue'
@@ -33,6 +35,7 @@ import type { VditorEditMode, VditorToolbarAction } from '@/components/common/Vd
 import BackupHistoryModal from '@/components/notes/BackupHistoryModal.vue'
 import NoteAlertDialog from '@/components/notes/NoteAlertDialog.vue'
 import NoteTreeItem from '@/components/notes/NoteTreeItem.vue'
+import { logFrontendAction } from '@/services/debug'
 import { listImageHosts, uploadImageWithHost } from '@/services/image-host'
 import { listBackups, readBackup, restoreBackup, saveNoteImage, syncNotes } from '@/services/note'
 import { useNotesStore } from '@/stores/notes'
@@ -221,9 +224,15 @@ const dialogState = reactive({
 const noteSyncing = ref(false)
 const noteSyncProgress = ref<NoteSyncProgress | null>(null)
 const noteSyncResult = ref<NoteSyncResult | null>(null)
-const rootDragOver = ref(false)
 let noteSyncTimer: ReturnType<typeof setInterval> | null = null
 let unlistenNoteSyncProgress: (() => void) | null = null
+const notesTreeDragGroup = {
+  name: 'notes-tree',
+  pull: true,
+  put: true,
+}
+const treeDropTargetParentPath = ref<string | null | undefined>(undefined)
+const treeMoveHandled = ref(false)
 
 // 导出功能相关状态
 const exportDropdownVisible = ref(false)
@@ -744,62 +753,113 @@ function openTreeContextMenu(payload: {
   treeContextMenu.nodeType = payload.nodeType
 }
 
-function readDraggedTreeNode(event: DragEvent) {
-  const raw = event.dataTransfer?.getData('application/x-note-tree-node')
-  if (!raw) {
-    return null
+function sortableElementNode(element?: HTMLElement | null) {
+  const path = element?.dataset.notePath
+  const nodeType = element?.dataset.noteType as 'directory' | 'file' | undefined
+
+  return path ? { path, nodeType: nodeType ?? 'file' } : null
+}
+
+function sortableNode(event: SortableEvent) {
+  return sortableElementNode(event.item as HTMLElement | undefined)
+}
+
+function sortableTargetParentPath(event: SortableEvent) {
+  return sortableTargetParentPathFromElement(event.to as HTMLElement | undefined)
+}
+
+function sortableTargetParentPathFromElement(element?: HTMLElement | null) {
+  return element?.dataset.parentPath || null
+}
+
+function sortableRowTargetParentPath(originalEvent?: Event) {
+  const target = originalEvent?.target
+  if (!(target instanceof HTMLElement)) {
+    return undefined
   }
 
-  try {
-    const payload = JSON.parse(raw) as { path?: string; nodeType?: 'directory' | 'file' }
-    return payload.path ? payload : null
-  } catch {
-    return null
+  const row = target.closest<HTMLElement>('.tree-item__row')
+  const item = row?.closest<HTMLElement>('.tree-item')
+  const path = item?.dataset.notePath
+  const nodeType = item?.dataset.noteType as 'directory' | 'file' | undefined
+
+  if (!path) {
+    return undefined
+  }
+
+  if (nodeType === 'directory') {
+    return path
+  }
+
+  return item?.parentElement?.dataset.parentPath || null
+}
+
+function isValidTreeTargetParent(draggedPath: string, targetParentPath: string | null) {
+  return !targetParentPath || (targetParentPath !== draggedPath && !targetParentPath.startsWith(`${draggedPath}/`))
+}
+
+function handleTreeDragStartEvent(event: SortableEvent) {
+  const node = sortableNode(event)
+  if (node) {
+    logFrontendAction('notes.tree.drag_start', node)
   }
 }
 
-function handleTreeMove(payload: { path: string; nodeType?: 'directory' | 'file'; targetParentPath: string | null }) {
-  void store.moveNode(payload.path, payload.targetParentPath, payload.nodeType ?? 'file').catch((err) => {
-    error.value = getErrorMessage(err, '移动笔记失败')
-  })
-}
-
-function handleRootDragOver(event: DragEvent) {
-  if (!event.dataTransfer?.types.includes('application/x-note-tree-node')) {
-    return
-  }
-
-  event.preventDefault()
-  rootDragOver.value = true
-  event.dataTransfer.dropEffect = 'move'
-}
-
-function handleRootDragLeave(event: DragEvent) {
-  if (!event.currentTarget || !event.relatedTarget) {
-    rootDragOver.value = false
-    return
-  }
-
-  const current = event.currentTarget as HTMLElement
-  const related = event.relatedTarget as Node
-  if (!current.contains(related)) {
-    rootDragOver.value = false
-  }
-}
-
-function handleRootDrop(event: DragEvent) {
-  event.preventDefault()
-  rootDragOver.value = false
-
-  const payload = readDraggedTreeNode(event)
-  if (!payload?.path) {
+function handleTreeAddEvent(event: SortableEvent) {
+  const node = sortableNode(event)
+  if (!node) {
+    logFrontendAction('notes.tree.drop_empty', { targetParentPath: sortableTargetParentPath(event) }, 'warn')
+    void store.refreshTree()
     return
   }
 
   handleTreeMove({
-    path: payload.path,
-    nodeType: payload.nodeType,
-    targetParentPath: null,
+    path: node.path,
+    nodeType: node.nodeType,
+    targetParentPath: treeDropTargetParentPath.value ?? sortableTargetParentPath(event),
+  })
+  treeMoveHandled.value = true
+}
+
+function canMoveTreeItem(event: MoveEvent, originalEvent?: Event) {
+  const node = sortableElementNode(event.dragged)
+  const rowParentPath = sortableRowTargetParentPath(originalEvent)
+  const targetParentPath = rowParentPath ?? sortableTargetParentPathFromElement(event.to)
+
+  if (!node) {
+    treeDropTargetParentPath.value = undefined
+    return false
+  }
+
+  const allowed = isValidTreeTargetParent(node.path, targetParentPath)
+  treeDropTargetParentPath.value = allowed ? rowParentPath : undefined
+  return allowed
+}
+
+function handleTreeEndEvent(event: SortableEvent) {
+  const node = sortableNode(event)
+  const sourceParentPath = sortableTargetParentPathFromElement(event.from as HTMLElement | undefined)
+  const targetParentPath = treeDropTargetParentPath.value
+
+  if (!treeMoveHandled.value && node && targetParentPath !== undefined && targetParentPath !== sourceParentPath) {
+    handleTreeMove({
+      path: node.path,
+      nodeType: node.nodeType,
+      targetParentPath,
+    })
+  } else if (!treeMoveHandled.value && event.from === event.to) {
+    void store.refreshTree()
+  }
+
+  treeDropTargetParentPath.value = undefined
+  treeMoveHandled.value = false
+}
+
+function handleTreeMove(payload: { path: string; nodeType?: 'directory' | 'file'; targetParentPath: string | null }) {
+  logFrontendAction('notes.tree.drop_move', payload)
+  void store.moveNode(payload.path, payload.targetParentPath, payload.nodeType ?? 'file').catch((err) => {
+    error.value = getErrorMessage(err, '移动笔记失败')
+    void store.refreshTree()
   })
 }
 
@@ -1818,13 +1878,19 @@ onBeforeUnmount(() => {
       </div>
 
       <template v-if="!sidebarCollapsed">
-        <div
+        <VueDraggable
           class="notes-tree"
-          :class="{ 'notes-tree--drag-over': rootDragOver }"
-          @dragover="handleRootDragOver"
-          @dragleave="handleRootDragLeave"
-          @drop="handleRootDrop"
-          @dragend="rootDragOver = false"
+          v-model="tree"
+          :animation="150"
+          :group="notesTreeDragGroup"
+          :force-fallback="true"
+          :fallback-on-body="true"
+          :empty-insert-threshold="18"
+          data-parent-path=""
+          @start="handleTreeDragStartEvent"
+          @add="handleTreeAddEvent"
+          @end="handleTreeEndEvent"
+          @move="canMoveTreeItem"
         >
           <p v-if="!tree.length && !loading" class="empty-tip">当前工作区还没有笔记，先创建一篇开始吧。</p>
 
@@ -1836,12 +1902,14 @@ onBeforeUnmount(() => {
             @open="store.openNote"
             @create-folder="promptCreateFolder"
             @create-note="promptCreateNote"
+            @drag-start="(payload) => logFrontendAction('notes.tree.drag_start', payload)"
             @rename="promptRename"
             @remove="confirmRemove"
             @open-menu="openTreeContextMenu"
             @move="handleTreeMove"
+            @refresh="store.refreshTree"
           />
-        </div>
+        </VueDraggable>
 
         <div class="notes-sync-panel">
           <button
@@ -2189,11 +2257,6 @@ onBeforeUnmount(() => {
   gap: 4px;
   border: 1px solid transparent;
   border-radius: 6px;
-}
-
-.notes-tree--drag-over {
-  border-color: #93c5fd;
-  background: #eff6ff;
 }
 
 /* 树节点优化（通过样式穿透或直接在组件中调整，这里假设使用 NoteTreeItem） */

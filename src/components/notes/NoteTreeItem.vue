@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { ChevronDown, ChevronRight, FileText, Folder } from '@lucide/vue'
+import { VueDraggable } from 'vue-draggable-plus'
+import type { MoveEvent, SortableEvent } from 'vue-draggable-plus'
 import type { NoteTreeNode } from '@/types/note'
 
 const props = defineProps<{
@@ -13,7 +15,9 @@ const emit = defineEmits<{
   open: [path: string]
   createFolder: [parentPath: string]
   createNote: [parentPath: string]
+  dragStart: [payload: { path: string; nodeType: NoteTreeNode['nodeType'] }]
   move: [payload: { path: string; nodeType: NoteTreeNode['nodeType']; targetParentPath: string | null }]
+  refresh: []
   rename: [path: string, currentName: string]
   remove: [path: string, nodeType: NoteTreeNode['nodeType']]
   openMenu: [
@@ -28,85 +32,135 @@ const emit = defineEmits<{
 }>()
 
 const expanded = ref(true)
-const dragOver = ref(false)
+const dropTargetParentPath = ref<string | null | undefined>(undefined)
+const moveHandled = ref(false)
 
 const currentDepth = computed(() => props.depth ?? 0)
 const isDirectory = computed(() => props.node.nodeType === 'directory')
 const isActive = computed(() => props.activePath === props.node.path)
-
-function dragPayload() {
-  return JSON.stringify({
-    path: props.node.path,
-    nodeType: props.node.nodeType,
-  })
-}
-
-function handleDragStart(event: DragEvent) {
-  event.stopPropagation()
-  event.dataTransfer?.setData('application/x-note-tree-node', dragPayload())
-  event.dataTransfer?.setData('text/plain', props.node.path)
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-  }
-}
-
-function handleDragOver(event: DragEvent) {
-  if (!isDirectory.value) {
-    event.stopPropagation()
-    return
-  }
-
-  event.preventDefault()
-  event.stopPropagation()
-  dragOver.value = true
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'move'
-  }
-}
-
-function handleDragLeave(event: DragEvent) {
-  if (!event.currentTarget || !event.relatedTarget) {
-    dragOver.value = false
-    return
-  }
-
-  const current = event.currentTarget as HTMLElement
-  const related = event.relatedTarget as Node
-  if (!current.contains(related)) {
-    dragOver.value = false
-  }
-}
-
-function handleDrop(event: DragEvent) {
-  if (!isDirectory.value) {
-    event.stopPropagation()
-    return
-  }
-
-  event.preventDefault()
-  event.stopPropagation()
-  dragOver.value = false
-
-  const raw = event.dataTransfer?.getData('application/x-note-tree-node')
-  if (!raw) {
-    return
-  }
-
-  try {
-    const payload = JSON.parse(raw) as { path?: string; nodeType?: NoteTreeNode['nodeType'] }
-    if (!payload.path || payload.path === props.node.path) {
-      return
+const childNodes = computed<NoteTreeNode[]>({
+  get() {
+    if (!props.node.children) {
+      props.node.children = []
     }
 
-    emit('move', {
-      path: payload.path,
-      nodeType: payload.nodeType ?? 'file',
-      targetParentPath: props.node.path,
-    })
-    expanded.value = true
-  } catch {
-    // Ignore malformed drag payloads from outside the tree.
+    return props.node.children
+  },
+  set(value) {
+    props.node.children = value
+  },
+})
+const draggableGroup = {
+  name: 'notes-tree',
+  pull: true,
+  put: true,
+}
+
+function elementNode(element?: HTMLElement | null) {
+  const path = element?.dataset.notePath
+  const nodeType = element?.dataset.noteType as NoteTreeNode['nodeType'] | undefined
+
+  if (!path) {
+    return null
   }
+
+  return {
+    path,
+    nodeType: nodeType ?? 'file',
+  }
+}
+
+function eventNode(event: SortableEvent) {
+  return elementNode(event.item as HTMLElement | undefined)
+}
+
+function targetParentPath(event: SortableEvent) {
+  return targetParentPathFromElement(event.to as HTMLElement | undefined)
+}
+
+function targetParentPathFromElement(element?: HTMLElement | null) {
+  return element?.dataset.parentPath || null
+}
+
+function rowTargetParentPath(originalEvent?: Event) {
+  const target = originalEvent?.target
+  if (!(target instanceof HTMLElement)) {
+    return undefined
+  }
+
+  const row = target.closest<HTMLElement>('.tree-item__row')
+  const item = row?.closest<HTMLElement>('.tree-item')
+  const path = item?.dataset.notePath
+  const nodeType = item?.dataset.noteType as NoteTreeNode['nodeType'] | undefined
+
+  if (!path) {
+    return undefined
+  }
+
+  if (nodeType === 'directory') {
+    return path
+  }
+
+  return item?.parentElement?.dataset.parentPath || null
+}
+
+function isValidTargetParent(draggedPath: string, nextParentPath: string | null) {
+  return !nextParentPath || (nextParentPath !== draggedPath && !nextParentPath.startsWith(`${draggedPath}/`))
+}
+
+function handleStart(event: SortableEvent) {
+  const node = eventNode(event)
+  if (node) {
+    emit('dragStart', node)
+  }
+}
+
+function handleAdd(event: SortableEvent) {
+  const node = eventNode(event)
+  if (!node) {
+    return
+  }
+
+  emit('move', {
+    path: node.path,
+    nodeType: node.nodeType,
+    targetParentPath: dropTargetParentPath.value ?? targetParentPath(event),
+  })
+  moveHandled.value = true
+}
+
+function canMove(event: MoveEvent, originalEvent?: Event) {
+  const draggedPath = elementNode(event.dragged)?.path
+  const rowParentPath = rowTargetParentPath(originalEvent)
+  const nextParentPath = rowParentPath ?? targetParentPathFromElement(event.to)
+
+  if (!draggedPath) {
+    dropTargetParentPath.value = undefined
+    return false
+  }
+
+  const allowed = isValidTargetParent(draggedPath, nextParentPath)
+  dropTargetParentPath.value = allowed ? rowParentPath : undefined
+  return allowed
+}
+
+function handleEnd(event: SortableEvent) {
+  const node = eventNode(event)
+  const sourceParentPath = targetParentPathFromElement(event.from as HTMLElement | undefined)
+  const nextParentPath = dropTargetParentPath.value
+
+  if (!moveHandled.value && node && nextParentPath !== undefined && nextParentPath !== sourceParentPath) {
+    emit('move', {
+      path: node.path,
+      nodeType: node.nodeType,
+      targetParentPath: nextParentPath,
+    })
+  } else if (!moveHandled.value && event.from === event.to) {
+    emit('refresh')
+  }
+
+  dropTargetParentPath.value = undefined
+  moveHandled.value = false
 }
 
 function forwardRename(path: string, currentName: string) {
@@ -137,15 +191,10 @@ function handleContextMenu(event: MouseEvent) {
     :class="{
       'tree-item--directory': isDirectory,
       'tree-item--file': !isDirectory,
-      'tree-item--drag-over': dragOver,
     }"
     :style="{ '--depth': currentDepth }"
-    draggable="true"
-    @dragstart="handleDragStart"
-    @dragover="handleDragOver"
-    @dragleave="handleDragLeave"
-    @drop="handleDrop"
-    @dragend="dragOver = false"
+    :data-note-path="node.path"
+    :data-note-type="node.nodeType"
   >
     <div
       class="tree-item__row"
@@ -172,11 +221,25 @@ function handleContextMenu(event: MouseEvent) {
       </div>
     </div>
 
-    <div v-if="isDirectory && expanded" class="tree-item__children">
-      <div v-if="!node.children?.length" class="tree-item__empty">空目录</div>
+    <VueDraggable
+      v-if="isDirectory && expanded"
+      v-model="childNodes"
+      class="tree-item__children"
+      :animation="150"
+      :group="draggableGroup"
+      :force-fallback="true"
+      :fallback-on-body="true"
+      :empty-insert-threshold="18"
+      :data-parent-path="node.path"
+      @start="handleStart"
+      @add="handleAdd"
+      @end="handleEnd"
+      @move="canMove"
+    >
+      <div v-if="!childNodes.length" class="tree-item__empty">空目录</div>
 
       <NoteTreeItem
-        v-for="child in node.children"
+        v-for="child in childNodes"
         :key="child.path"
         :active-path="activePath"
         :depth="currentDepth + 1"
@@ -184,12 +247,14 @@ function handleContextMenu(event: MouseEvent) {
         @open="emit('open', $event)"
         @create-folder="emit('createFolder', $event)"
         @create-note="emit('createNote', $event)"
+        @drag-start="emit('dragStart', $event)"
         @rename="forwardRename"
         @remove="forwardRemove"
         @open-menu="emit('openMenu', $event)"
         @move="emit('move', $event)"
+        @refresh="emit('refresh')"
       />
-    </div>
+    </VueDraggable>
   </div>
 </template>
 
@@ -209,11 +274,6 @@ function handleContextMenu(event: MouseEvent) {
 
 .tree-item--file {
   margin-left: calc(var(--depth, 0) * 12px);
-}
-
-.tree-item--drag-over > .tree-item__row {
-  background: #e0ecff;
-  outline: 1px solid #93c5fd;
 }
 
 .tree-item__row {
@@ -296,6 +356,7 @@ function handleContextMenu(event: MouseEvent) {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  min-height: 18px;
   padding: 0 0 4px;
   border-top: 0;
 }
@@ -305,5 +366,11 @@ function handleContextMenu(event: MouseEvent) {
   padding: 6px 9px 0;
   color: #98a2b3;
   font-size: 12px;
+}
+
+.sortable-ghost > .tree-item__row,
+.sortable-chosen > .tree-item__row {
+  background: #e0ecff;
+  outline: 1px solid #93c5fd;
 }
 </style>
